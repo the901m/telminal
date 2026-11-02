@@ -11,6 +11,9 @@ from pathlib import Path
 from subprocess import PIPE
 from time import time
 
+import sys
+from telethon import Button
+
 import pexpect
 from pexpect.exceptions import EOF
 from pexpect.exceptions import TIMEOUT
@@ -179,6 +182,7 @@ class Telminal:
         self._render = True
         self._watch_tasks = {}
         self._last_process = None
+        self.download_semaphore = asyncio.Semaphore(5)
 
     @classmethod
     async def process_cleaner(cls):
@@ -484,34 +488,90 @@ class Telminal:
         await self.bot.send_message(event.chat_id, message, reply_to=reply_to)
 
     async def _send_download_buttons(self, event):
-        from telethon import Button
-
         message_id, file_name = event.id, event.file.name
-        buttons = []
+
         if os.path.exists(file_name):
-            message = f"`{file_name}` currentlly exists on this directory"
-            buttons.extend(
+            # File already exists: Send interactive options prompt
+            message = f"`{file_name}` currently exists in this directory"
+            buttons = [
                 [
-                    [
-                        Button.inline(
-                            "Save as new file", data=f"savefile&new&{message_id}"
-                        )
-                    ],
-                    [Button.inline("Overwrite", data=f"savefile&true&{message_id}")],
-                ]
-            )
+                    Button.inline(
+                        "Save as new file", data=f"savefile&new&{message_id}"
+                    )
+                ],
+                [Button.inline("Overwrite", data=f"savefile&true&{message_id}")],
+                [Button.inline("Cancel", data="removeme")],
+            ]
+
+            try:
+                await self.bot.send_message(
+                    event.chat_id,
+                    message,
+                    reply_to=message_id,
+                    buttons=buttons,
+                )
+            except Exception as e:
+                sys.stdout.write(f"[Warning] Failed to send conflict prompt: {e}\n")
         else:
-            message = "Do you want to save this file on sever?"
-            buttons.append([Button.inline("Yes", data=f"savefile&new&{message_id}")])
+            def dummy_callback(current, total):
+                pass
 
-        buttons.append([Button.inline("Cancell", data="removeme")])
+            async with self.download_semaphore:
+                try:
+                    await self.bot.download_media(
+                        event.message,
+                        progress_callback=dummy_callback,
+                        file=None,
+                    )
 
-        await self.bot.send_message(
-            event.chat_id,
-            message,
-            reply_to=message_id,
-            buttons=buttons,
-        )
+                    # Use standard allowed reaction emoji (Thumbs Up)
+                    await self._safe_react(event, "👍")
+
+                except Exception as e:
+                    sys.stdout.write(f"[Error] Failed to download {file_name}: {e}\n")
+                    # Use standard allowed reaction emoji (Thumbs Down)
+                    await self._safe_react(event, "👎")
+
+                await asyncio.sleep(0.5)
+
+    async def _safe_react(self, event, emoji: str):
+        import sys
+        from telethon import functions, types
+
+        try:
+            client = getattr(self.bot, "_client", self.bot)
+
+            await client(
+                functions.messages.SendReactionRequest(
+                    peer=event.chat_id,
+                    msg_id=event.id,
+                    reaction=[types.ReactionEmoji(emoticon=emoji)],
+                )
+            )
+        except Exception as e:
+            sys.stdout.write(
+                f"[Warning] Could not react '{emoji}' to message {event.id}: {e}\n"
+            )
+    async def _safe_react(self, event, emoji: str):
+        import sys
+        from telethon import functions, types
+
+        try:
+            # Extract underlying Telethon client instance
+            client = getattr(self.bot, "_client", self.bot)
+
+            # Native Telethon 1.x reaction request
+            await client(
+                functions.messages.SendReactionRequest(
+                    peer=event.chat_id,
+                    msg_id=event.id,
+                    reaction=[types.ReactionEmoji(emoticon=emoji)],
+                )
+            )
+        except Exception as e:
+            sys.stdout.write(
+                f"[Warning] Could not react '{emoji}' to message {event.id}: {e}\n"
+            )    
 
     async def _change_directory(self, event):
         path = event.message.message.split(" ", 1)[-1]
@@ -531,7 +591,7 @@ class Telminal:
         chat_id, request_id = event.chat_id, event.message.id
 
         if event.file:
-            await self._send_download_buttons(event)
+            asyncio.shield(self._send_download_buttons(event))
 
         elif message.startswith(("cd", "/", "!")) and not escape:
             command = message.split(" ", 1)[0]
@@ -639,13 +699,23 @@ class Telminal:
         {title}
         {emoji_count * emoji} {percent_str}
         """
+        
         # showing upload state to user each 5 second
         if (
             int(time() - self.all_progress_callback.get(message_id, 0)) > 5
             or upload_finished
         ):
-            await self.bot.edit_message(chat_id, message_id=message_id, message=text)
+            # Update the last-sent timestamp BEFORE making the API call
+            # This prevents simultaneous threads from spamming edits if one takes too long
             self.all_progress_callback[message_id] = time()
+            
+            try:
+                await self.bot.edit_message(chat_id, message_id=message_id, message=text)
+            except Exception as e:
+                # Catching any network or flood/rate-limiting errors safely.
+                # We log it to stdout silently without breaking the active file transfer stream.
+                import sys
+                sys.stdout.write(f"[Warning] Failed to update progress message {message_id}: {e}\n")
 
     @check_permission
     async def _confirm_download_handler(self, event):
